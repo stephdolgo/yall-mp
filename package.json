@@ -134,6 +134,26 @@
       "target": "dmg",
       "icon": "build/icon.icns",
       "artifactName": "${productName} v${version}.${ext}",
+      "electronLanguages": [
+        "en",
+        "pl"
+      ],
+      "extraResources": [
+        {
+          "from": "electron-resources/extensions",
+          "to": "electron-resources/extensions",
+          "filter": [
+            "**/*"
+          ]
+        },
+        {
+          "from": "mpv",
+          "to": "mpv",
+          "filter": [
+            "**/*.lua"
+          ]
+        }
+      ],
       "fileAssociations": [
         {
           "ext": [
