@@ -82,6 +82,7 @@ let videoWindow: BrowserWindow | null = null;
 let subtitlesLookupWindow: BrowserWindow | null = null;
 let subtitlesLookupView: WebContentsView | null = null;
 let currentSubtitlesLookupContext: { clipSubtitleId: string; originalSelection: string; } | null = null;
+
 let preMaximizeBounds: Electron.Rectangle | null = null;
 let isFixingMaximize = false;
 let isProgrammaticResize = false;
@@ -106,6 +107,43 @@ const MIN_HEIGHT = 600;
 let initialAppBounds: Electron.Rectangle | null = null;
 let pendingFilesToOpen: string[] = [];
 const DRAGGABLE_ZONE_PADDING = 3; // 3px on all sides
+
+// macOS: mpv cannot embed, so it plays behind a transparent mainWindow.
+// The page paints black over that and reveals the video through it.
+const isMacOs = process.platform === 'darwin';
+let macVideoRect: Electron.Rectangle | null = null; 
+let macBackdropClip = ''; 
+let macVideoShown = false;
+const MAC_BACKDROP_INSET = 2; // overlaps black to give illusion of being a part of the app
+
+// macOS: uiWindow owns its own position while being dragged.
+let uiDragUntil = 0; 
+let macDragCssKey: string | null = null;
+const DRAG_HANDLE_ON_CSS = '.drag-handle { -webkit-app-region: drag; }';
+const DRAG_HANDLE_OFF_CSS = `
+  .drag-handle {
+    -webkit-app-region: no-drag;
+    opacity: .35;
+    cursor: default;
+    position: relative;
+  }
+  .drag-handle:hover::after {
+    content: "Dragging is disabled until a video loads";
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 6px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    background: rgba(0, 0, 0, .88);
+    color: #e8eaed;
+    font: 12px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 1;
+    z-index: 2147483647;
+  }
+`;
 
 async function ensureFFmpegPaths(): Promise<void> {
   if (isFfmpegPathsInitialized) {
@@ -327,6 +365,116 @@ function blockDefaultBrowserShortcuts(event: Electron.Event, input: Electron.Inp
   }
 }
 
+function refreshMacBackdrop(): void {
+  // macOS: re-clips the backdrop over mpv's window.
+  // macVideoRect is in screen points, so this runs on every move and resize.
+
+  if (process.platform !== 'darwin' || !mainWindow || mainWindow.isDestroyed()) {
+    return;
+  }
+
+  let clip = 'none';
+
+  if (macVideoRect) {
+    const bounds = mainWindow.getBounds();
+
+    let left = Math.round(macVideoRect.x - bounds.x) + MAC_BACKDROP_INSET;
+    let top = Math.round(macVideoRect.y - bounds.y) + MAC_BACKDROP_INSET;
+    let right = left + Math.round(macVideoRect.width) - MAC_BACKDROP_INSET * 2;
+    let bottom = top + Math.round(macVideoRect.height) - MAC_BACKDROP_INSET * 2;
+
+    if (videoWindow && !videoWindow.isDestroyed()) {
+      const v = videoWindow.getBounds();
+      const limitLeft = Math.round(v.x - bounds.x);
+      const limitTop = Math.round(v.y - bounds.y);
+      left = Math.max(left, limitLeft);
+      top = Math.max(top, limitTop);
+      right = Math.min(right, limitLeft + Math.round(v.width));
+      bottom = Math.min(bottom, limitTop + Math.round(v.height));
+    }
+
+    if (right > left && bottom > top) {
+      clip =
+        'polygon(evenodd,' +
+        ' 0px 0px, 100% 0px, 100% 100%, 0px 100%, 0px 0px,' +
+        ` ${left}px ${top}px, ${left}px ${bottom}px,` +
+        ` ${right}px ${bottom}px, ${right}px ${top}px,` +
+        ` ${left}px ${top}px)`;
+    }
+  }
+
+  if (clip === macBackdropClip) {
+    return;
+  }
+  macBackdropClip = clip;
+
+  mainWindow.webContents
+    .executeJavaScript(
+      `window.__yallBackdrop && window.__yallBackdrop(${JSON.stringify(clip)});`,
+      true
+    )
+    .catch(() => {
+      // The page is reloading; the backdrop is rebuilt on did-finish-load.
+      macBackdropClip = '';
+    });
+}
+
+function setUiDraggable(enabled: boolean): void {
+  // macOS: drag is off until a video loads, see MACOS.md.
+
+  if (process.platform !== 'darwin' || !uiWindow || uiWindow.isDestroyed()) {
+    return;
+  }
+
+  const contents = uiWindow.webContents;
+  const previous = macDragCssKey;
+  macDragCssKey = null;
+
+  const apply = () => contents
+    .insertCSS(enabled ? DRAG_HANDLE_ON_CSS : DRAG_HANDLE_OFF_CSS)
+    .then((key) => { macDragCssKey = key; })
+    .catch((err) => console.warn('[Main] Drag handle CSS failed:', err));
+  
+  // Swap rather than stack, or the dimmed styling survives being re-enabled.
+  if (previous) {
+    contents.removeInsertedCSS(previous).catch(() => { /* page reloaded */ }).then(apply);
+  } else {
+    void apply();
+  }
+}
+
+function setMacVideoRect(rect: Electron.Rectangle | null): void {
+  // macOS: the UI keeps a placeholder over the video until told it is visible.
+  // mpv reporting its geometry is taken as proof that there is a picture.
+
+  if (process.platform !== 'darwin') {
+    return;
+  }
+
+  macVideoRect = rect;
+
+  if (!rect) {
+    macVideoShown = false;
+  } else if (!macVideoShown && mainWindow && !mainWindow.isDestroyed() && !mainWindow.isMinimized()) {
+    macVideoShown = true;
+    isVideoWindowVisible = true;
+    safeShowVideoWindow();
+    setMainWindowLoadingState(false);
+
+    // Sent twice: the UI puts the placeholder back during its own startup, and
+    // nothing moves the window afterwards to trigger the dismissal below.
+    for (const delay of [700, 1800]) {
+      setTimeout(() => {
+        if (!uiWindow || uiWindow.isDestroyed() || !macVideoShown) { return; }
+        if (!mainWindow || mainWindow.isDestroyed() || mainWindow.isMinimized()) { return; }
+        uiWindow.webContents.send('mpv:video-visibility-change', true);
+      }, delay);
+    }
+  }
+
+  refreshMacBackdrop();
+}
+
 async function createWindow() {
   const primaryDisplay = screen.getPrimaryDisplay();
   const workArea = primaryDisplay.workArea;
@@ -348,12 +496,80 @@ async function createWindow() {
   };
 
   mainWindow = new BrowserWindow({
+    // macOS: transparent so mpv shows through, and the page paints black over it.
+    // hasShadow is off because a cached shadow lingers over the video on resize.
+
     ...initialAppBounds,
-    transparent: false,
-    backgroundColor: '#000000',
+    ...(isMacOs ? { transparent: true, backgroundColor: '#00000000', hasShadow: false } : {}),
     frame: false,
     show: false,
   });
+
+  if (isMacOs) {
+    mainWindow.webContents.on('did-finish-load', () => {
+      if (!mainWindow || mainWindow.isDestroyed()) {
+        return;
+      }
+
+      const transparentBackdropCss = `
+        html, body,
+        .view-container,
+        .skeleton-wrapper,
+        .skeleton-header,
+        .skeleton-video,
+        .skeleton-controls,
+        .skeleton-timeline,
+        .loading-wrapper {
+          background: transparent !important;
+          box-shadow: none !important;
+        }
+        #skeleton-view,
+        #loading-view {
+          display: none !important;
+        }
+      `;
+      mainWindow.webContents
+        .insertCSS(transparentBackdropCss)
+        .catch((err) => console.warn('[Main] Transparent backdrop CSS failed:', err));
+
+      // Our own black layer, at z-index -1 so it can never cover app content.
+      const backdropScript = `
+        (() => {
+          let el = document.getElementById('yall-mac-backdrop');
+          if (!el) {
+            el = document.createElement('div');
+            el.id = 'yall-mac-backdrop';
+            el.style.cssText =
+              'position:fixed;inset:0;background:#000;z-index:-1;pointer-events:none;';
+            document.body.insertBefore(el, document.body.firstChild);
+          }
+          window.__yallBackdrop = (clip) => {
+            if (clip === 'off') { el.style.display = 'none'; return; }
+            el.style.display = '';
+            el.style.clipPath = clip;
+          };
+        })();
+      `;
+      mainWindow.webContents
+        .executeJavaScript(backdropScript, true)
+        .then(() => {
+          macBackdropClip = '';
+          refreshMacBackdrop();
+        })
+        .catch((err) => console.warn('[Main] Backdrop setup failed:', err));
+
+      mainWindow.webContents
+        .executeJavaScript(`
+          (() => {
+            for (const id of ['skeleton-view', 'loading-view']) {
+              const el = document.getElementById(id);
+              if (el) { el.remove(); }
+            }
+          })();
+        `, true)
+        .catch((err) => console.warn('[Main] host overlay removal failed:', err));
+    });
+  }
 
   const isDev = !app.isPackaged;
 
@@ -392,6 +608,7 @@ async function createWindow() {
     ...initialAppBounds,
     transparent: true,
     frame: false,
+    ...(isMacOs ? { hasShadow: false } : {}),   // see mainWindow for macOS above
     parent: mainWindow,
     webPreferences: {
       nodeIntegration: false,
@@ -403,6 +620,51 @@ async function createWindow() {
 
   uiWindow.webContents.on('before-input-event', (event, input) => {
     blockDefaultBrowserShortcuts(event, input);
+  });
+
+  if (isMacOs) {
+    // macOS: setShape() is a no-op here, so uiWindow swallows every click.
+    // Being frameless, it can be dragged directly instead.
+    uiWindow.webContents.on('did-finish-load', () => {
+      macDragCssKey = null;   // a reload drops any CSS we inserted
+      setUiDraggable(!!uiWindow && !uiWindow.isDestroyed() &&
+                     uiWindow.getParentWindow() !== mainWindow);
+
+    });
+  }
+
+  // Add-on for all platforms, Optional: injected if electron-resources/extensions/gender-german exists 
+  // Reaches Yomitan through the app's preload bridge
+  uiWindow.webContents.on('did-finish-load', () => {
+    const base = app.isPackaged ? process.resourcesPath : app.getAppPath();
+    const addonDir = path.join(base, 'electron-resources', 'extensions', 'gender-german');
+
+    void (async () => {
+      let js: string;
+      try {
+        js = await fs.readFile(path.join(addonDir, 'gender-german.js'), 'utf8');
+      } catch {
+        return; // not installed - the normal case
+      }
+
+      let css = '';
+      try {
+        css = await fs.readFile(path.join(addonDir, 'gender-german.css'), 'utf8');
+      } catch { /* stylesheet is optional */ }
+
+      if (!uiWindow || uiWindow.isDestroyed()) {
+        return;
+      }
+
+      try {
+        if (css) {
+          await uiWindow.webContents.insertCSS(css);
+        }
+        await uiWindow.webContents.executeJavaScript(js, true);
+      } catch (err) {
+        console.warn('[Main] gender-german add-on failed:', err);
+      }
+    })();
   });
 
   const syncWindowGeometry = () => {
@@ -423,7 +685,9 @@ async function createWindow() {
     }
 
     // Hide video window immediately during movement to prevent visual desync
-    if (!isRestoring && videoWindow && !videoWindow.isDestroyed() && videoWindow.isVisible()) {
+    // macOS: skipped, since nothing is embedded in videoWindow.
+    // Hiding it only makes the whole app vanish mid-drag.
+    if (!isMacOs && !isRestoring && videoWindow && !videoWindow.isDestroyed() && videoWindow.isVisible()) {
       safeHideVideoWindow();
     }
 
@@ -443,7 +707,22 @@ async function createWindow() {
       height: Math.round(bounds.height)
     };
 
-    uiWindow.setBounds(sanitizedBounds);
+    if (!isMacOs || Date.now() >= uiDragUntil) {
+      // macOS: mid-drag uiWindow owns its position, but not its size.
+      // Otherwise the backdrop covers a different rectangle than the controls.
+
+      uiWindow.setBounds(sanitizedBounds);
+    } else {
+      const current = uiWindow.getBounds();
+      if (current.width !== sanitizedBounds.width || current.height !== sanitizedBounds.height) {
+        uiWindow.setBounds({
+          x: current.x,
+          y: current.y,
+          width: sanitizedBounds.width,
+          height: sanitizedBounds.height
+        });
+      }
+    }
     if (videoWindow && !videoWindow.isDestroyed()) {
       videoWindow.setBounds(sanitizedBounds);
     }
@@ -454,6 +733,7 @@ async function createWindow() {
       uiWindow.webContents.send('mpv:mainWindowMovedOrResized');
     }
     updateUiWindowShape();
+    refreshMacBackdrop();
 
     showVideoTimeout = setTimeout(() => {
       // Re-verify state before showing: if the user minimized the app during this 250ms delay, do NOT show the video.
@@ -465,6 +745,45 @@ async function createWindow() {
         // Fallback: If video isn't ready, at least show UI (e.g. if file not loaded yet)
         safeShowUiWindow();
         setMainWindowLoadingState(false);
+      }
+
+      // macOS: re-asserts visibility, since the UI shows a spinner on every move.
+      // Only one of the branches above sends the dismissal.
+      if (isMacOs && macVideoShown && uiWindow && !uiWindow.isDestroyed() &&
+          mainWindow && !mainWindow.isMinimized() && !isRestoring) {
+        uiWindow.webContents.send('mpv:video-visibility-change', true);
+      }
+
+      // macOS: forces a repaint, as transparent windows keep stale pixels.
+      if (isMacOs) {
+        for (const win of [mainWindow, uiWindow]) {
+          if (win && !win.isDestroyed()) {
+            try {
+              win.webContents.invalidate();
+            } catch { /* not fatal - the pixels just stay stale */ }
+          }
+        }
+
+        // invalidate() alone is not enough - the page believes nothing changed,
+        // so nudge opacity for one frame to dirty every layer.
+        for (const win of [mainWindow, uiWindow]) {
+          if (win && !win.isDestroyed()) {
+            win.webContents
+              .executeJavaScript(`
+                (() => {
+                  const root = document.documentElement;
+                  root.style.opacity = '0.999';
+                  requestAnimationFrame(() => { root.style.opacity = ''; });
+                })();
+              `, true)
+              .catch(() => { /* page busy or reloading - cosmetic only */ });
+          }
+        }
+
+        // Re-issue the clip path to dirty the backdrop's own layer; the cached
+        // check in refreshMacBackdrop would otherwise skip it.
+        macBackdropClip = '';
+        refreshMacBackdrop();
       }
     }, 250);
   };
@@ -514,6 +833,23 @@ async function createWindow() {
     // Otherwise, a user resized the UI window. Force the main window to match it.
     mainWindow.setBounds(uiWindow.getBounds());
   });
+
+  // macOS: only runs once uiWindow is no longer a child of mainWindow.
+  if (isMacOs) {
+    uiWindow.on('move', () => {
+      if (isProgrammaticResize || !mainWindow || mainWindow.isDestroyed()) { return; }
+      if (!uiWindow || uiWindow.isDestroyed()) { return; }
+      if (uiWindow.getParentWindow() === mainWindow) { return; }
+
+      const uiBounds = uiWindow.getBounds();
+      const mainBounds = mainWindow.getBounds();
+      if (uiBounds.x === mainBounds.x && uiBounds.y === mainBounds.y) { return; }
+
+      // Claim authority for a moment so the sync does not yank uiWindow back.
+      uiDragUntil = Date.now() + 400;
+      mainWindow.setBounds({...mainBounds, x: uiBounds.x, y: uiBounds.y});
+    });
+  }
 
   uiWindow.on('focus', () => {
     if (subtitlesLookupWindow && !subtitlesLookupWindow.isDestroyed() && subtitlesLookupWindow.isVisible()) {
@@ -707,6 +1043,17 @@ if (!gotTheLock) {
   });
 
   app.whenReady().then(async () => {
+    // macOS: apps launched from Finder get a minimal PATH without Homebrew.
+    // Without these, mpv and audiowaveform read as missing.
+    if (process.platform === 'darwin') {
+      const brewPaths = ['/opt/homebrew/bin', '/usr/local/bin'];
+      const current = (process.env.PATH || '').split(':');
+      const missing = brewPaths.filter((dir) => !current.includes(dir));
+      if (missing.length) {
+        process.env.PATH = [...missing, ...current].filter(Boolean).join(':');
+      }
+    }
+
     try {
       const configStr = await fs.readFile(APP_DATA_PATH, 'utf-8');
       const config = JSON.parse(configStr);
@@ -1308,6 +1655,8 @@ if (!gotTheLock) {
         resizable: false,
         focusable: false,
         parent: mainWindow,
+        // macOS: sits above mainWindow, where a default background dims the video.
+        ...(process.platform === 'darwin' ? { backgroundColor: '#00000000', hasShadow: false } : {}), 
       });
 
       videoWindow.setIgnoreMouseEvents(true);
@@ -1325,6 +1674,9 @@ if (!gotTheLock) {
 
       // uiWindow is the child of videoWindow to always be on top and prevent stacking order issues:
       uiWindow.setParentWindow(videoWindow);
+
+      // macOS: no longer a child of mainWindow, so the drag handle can go on.
+      setUiDraggable(true);
 
       mpvManager = new MpvManager(videoWindow);
       mpvManager.customMpvPath = customExecutables.mpv;
@@ -1356,6 +1708,11 @@ if (!gotTheLock) {
         }
       };
       mpvManager.on('status', onMpvStatus);
+
+      // macOS: mpv reports where its own window landed, for the backdrop to reveal.
+      // Solid black until it says otherwise.
+      setMacVideoRect(null);
+      mpvManager.on('video-rect', (rect: Electron.Rectangle | null) => setMacVideoRect(rect));
 
       mpvManager.on('error', (err) => console.error("MPV Error:", err));
       mpvManager.on('ready', () => {
@@ -1478,6 +1835,7 @@ if (!gotTheLock) {
       // Reset UI parent window
       if (uiWindow && !uiWindow.isDestroyed() && mainWindow && !mainWindow.isDestroyed()) {
         uiWindow.setParentWindow(mainWindow);
+        setUiDraggable(false);   // child of mainWindow again - see setUiDraggable()
       }
 
       // Cleanup subtitles lookup window if open
@@ -1920,6 +2278,7 @@ async function handleAnkiBatchExport(request: AnkiBatchExportRequest) {
       audioArgs.push(
         '-vn',                                    // No video
         '-acodec', 'libmp3lame',                  // Use MP3 codec
+        '-ac', '2',                               // Downmix: lame cannot encode >2 channels
         '-q:a', '2',                              // Audio quality (VBR)
         audioPath
       );
@@ -1976,6 +2335,8 @@ async function handleAnkiBatchExport(request: AnkiBatchExportRequest) {
           '-b:v', '0',                              // Must be 0 when using CRF
           '-vf', 'scale=-2:480',                    // Scale to 480p height to keep size down
           '-c:a', 'libopus',                        // Opus audio codec
+          '-ac', '2',                               // Downmix: libopus rejects 5.1(side), which
+                                                    // fails the whole export on E-AC3/DTS sources
           '-b:a', '96k',                            // Audio bitrate
           videoPath
         );

@@ -1,5 +1,5 @@
 import {EventEmitter} from 'events';
-import {app, type BrowserWindow} from 'electron';
+import {app, screen, type BrowserWindow} from 'electron';
 import Mpv, {StatusObject} from 'node-mpv';
 import type {SubtitleSelection} from './src/app/model/project.types';
 import path from 'path';
@@ -13,6 +13,12 @@ export class MpvManager extends EventEmitter {
   public mediaPath: string = '';
   public customMpvPath?: string;
   private mpv: Mpv | null = null;
+
+  // macOS: mpv runs in its own window behind the app's transparent window.
+  // applyGeometry() centres and sizes it over the video area.
+  private geometryPoll: NodeJS.Timeout | null = null;
+  private lastGeometry = '';
+  private applyingGeometry = false;
 
   constructor(private win: BrowserWindow) {
     super();
@@ -40,8 +46,9 @@ export class MpvManager extends EventEmitter {
     const basePath = app.isPackaged ? process.resourcesPath : app.getAppPath();
     const scriptPath = path.join(basePath, 'mpv', 'yall_auto_pause.lua');
 
+    const isMac = process.platform === 'darwin';
+
     const args = [
-      `--wid=${this.win.getNativeWindowHandle().readInt32LE(0)}`,
       `--script=${scriptPath}`,
       '--no-config',
       '--vo=gpu,xv,x11',
@@ -68,6 +75,15 @@ export class MpvManager extends EventEmitter {
       `--volume=${volume}`,
       `--mute=${isMuted ? 'yes' : 'no'}`,
     ];
+
+    if (isMac) {
+      // macOS: gives us the window size we ask for, not the video's aspect ratio.
+      // Also stops mpv resizing itself to the video's native resolution on load.
+      args.push('--keepaspect-window=no');
+      args.push('--auto-window-resize=no');
+    } else {
+      args.unshift(`--wid=${this.win.getNativeWindowHandle().readInt32LE(0)}`);
+    }
 
     if (audioTrackIndex !== null) {
       args.push(`--aid=${audioTrackIndex}`);
@@ -119,6 +135,13 @@ export class MpvManager extends EventEmitter {
         }
       } else {
         await this.hideSubtitles();
+      }
+
+      if (isMac) {
+        // macOS: polled, as Electron does not reliably emit move or resize
+        // for programmatic setBounds() calls.
+        this.applyGeometry(true);
+        this.geometryPoll = setInterval(() => this.applyGeometry(), 200);
       }
 
       this.emit('ready');
@@ -221,7 +244,107 @@ export class MpvManager extends EventEmitter {
     this.mpv.observeProperty(property);
   }
 
+  private currentGeometry(): string | null {
+    // Position and size as one string, so a change can be spotted in one comparison.
+    if (!this.win || this.win.isDestroyed()) {
+      return null;
+    }
+    const b = this.win.getBounds();
+    return `${Math.round(b.width)}x${Math.round(b.height)}+${Math.round(b.x)}+${Math.round(b.y)}`;
+  }
+
+  private applyGeometry(force = false): void {
+    // macOS: sizes and centres mpv's window over the app's video area.
+    // window-scale does the sizing, as geometry only moves a window at runtime.
+    if (process.platform !== 'darwin' || !this.mpv || this.applyingGeometry) {
+      return;
+    }
+    if (!this.win || this.win.isDestroyed()) {
+      return;
+    }
+
+    const windowKey = this.currentGeometry();
+    if (!windowKey) {
+      return;
+    }
+
+    const bounds = this.win.getBounds();
+    this.applyingGeometry = true;
+
+    void (async () => {
+      try {
+        const videoWidth = Number(await this.mpv?.getProperty('dwidth'));
+        const videoHeight = Number(await this.mpv?.getProperty('dheight'));
+
+        if (!videoWidth || !videoHeight) {
+          // Nothing loaded yet. Clearing the marker makes the next poll retry.
+          this.lastGeometry = '';
+          return;
+        }
+
+        const key = `${windowKey}@${videoWidth}x${videoHeight}`;
+        if (!force && key === this.lastGeometry) {
+          return;
+        }
+
+        // mpv needs pixels, Electron gives points.
+        const display = screen.getDisplayMatching(bounds);
+        const dpr = display.scaleFactor || 1;
+
+        // Electron measures y from the display top, mpv from the work area.
+        // The work area starts below the menu bar.
+        const originX = display.workArea.x - display.bounds.x;
+        const originY = display.workArea.y - display.bounds.y;
+
+        const fitScale = Math.min(bounds.width / videoWidth, bounds.height / videoHeight);
+        if (!isFinite(fitScale) || fitScale <= 0) {
+          this.lastGeometry = '';
+          return;
+        }
+
+        const scale = fitScale * dpr;
+        await this.mpv?.setProperty('window-scale', scale);
+
+        // size of window in points
+        const scaledWidth = Math.round(videoWidth * fitScale);
+        const scaledHeight = Math.round(videoHeight * fitScale);
+        const xPoints = bounds.x + (bounds.width - scaledWidth) / 2;
+        const yPoints = bounds.y + (bounds.height - scaledHeight) / 2;
+
+        // size of window in pixels
+        const x = Math.round((xPoints - originX) * dpr);
+        const y = Math.round((yPoints - originY) * dpr);
+
+        await this.mpv?.setProperty('geometry', `+${x}+${y}`);
+
+        // Where mpv actually landed, for the backdrop to reveal.
+        this.emit('video-rect', {
+          x: x / dpr + originX,
+          y: y / dpr + originY,
+          width: scaledWidth,
+          height: scaledHeight,
+        });
+
+        this.lastGeometry = key;
+      } catch (err) {
+        // Left in: if the video ever stops following the window, this says why.
+        console.warn('[mpv geometry] failed:', err);
+        this.lastGeometry = '';
+      } finally {
+        this.applyingGeometry = false;
+      }
+    })();
+  }
+
   public stop(): void {
+    if (this.geometryPoll) {
+      clearInterval(this.geometryPoll);
+      this.geometryPoll = null;
+    }
+    this.lastGeometry = '';
+
+    this.emit('video-rect', null);  // No video window: the backdrop becomes solid.
+
     if (this.mpv) {
       this.mpv.quit();
       this.mpv = null;
